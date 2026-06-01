@@ -46,6 +46,15 @@ torch.manual_seed(42)
 np.random.seed(42)
 random.seed(42)
 
+def _list_patch_pngs(directory: Path) -> List[Path]:
+    """List 32x32 patch PNGs in a folder (top-level, or one level of nesting)."""
+    directory = Path(directory)
+    files = sorted(directory.glob("*.png"))
+    if not files:
+        files = sorted(directory.glob("*/*.png"))
+    return files
+
+
 def _stem_from_patch_path(path: Path) -> str:
     """From patch filename like DJI_xxx_q01_p0062.png or _n0001.png return stem DJI_xxx_q01."""
     s = path.stem
@@ -68,8 +77,8 @@ class BinaryWalnutDataset(Dataset):
             self.positive_files = [Path(p) for p in positive_files]
             self.negative_files = [Path(p) for p in negative_files]
         else:
-            self.positive_files = list(self.positive_dir.glob("*.png"))
-            self.negative_files = list(self.negative_dir.glob("*.png"))
+            self.positive_files = _list_patch_pngs(self.positive_dir)
+            self.negative_files = _list_patch_pngs(self.negative_dir)
         
         print(f"Found {len(self.positive_files)} positive samples")
         print(f"Found {len(self.negative_files)} negative samples")
@@ -674,8 +683,8 @@ def create_data_loaders(dataset_dir: str, batch_size: int = 32,
     val_neg = dataset_path / "val" / "negative"
 
     if train_pos.exists() and train_neg.exists() and val_pos.exists() and val_neg.exists() and \
-       len(list(train_pos.glob("*.png"))) > 0 and len(list(train_neg.glob("*.png"))) > 0 and \
-       len(list(val_pos.glob("*.png"))) > 0 and len(list(val_neg.glob("*.png"))) > 0:
+       len(_list_patch_pngs(train_pos)) > 0 and len(_list_patch_pngs(train_neg)) > 0 and \
+       len(_list_patch_pngs(val_pos)) > 0 and len(_list_patch_pngs(val_neg)) > 0:
         print("Using train/val split (image-level)")
         positive_dir = str(train_pos)
         negative_dir = str(train_neg)

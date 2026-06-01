@@ -1,0 +1,115 @@
+run setup.py
+- python setup.py
+
+activate venv
+- source venv/bin/activate
+
+build the dataset (this will extract negativce and positive patches from the annotations and images and divide into this format )
+- python build_annotations11_10_dataset.py \
+   --image_dir output \
+   --annotation_dir output/annotations \
+   --output_dir output/dataset \
+   --n_train 2 --n_val 1 --n_test 1 --clean
+
+Train from scratch (needed once so models/*.pth exists for the sweep below)
+- python binary_classifier.py \
+  --dataset_dir output/dataset \
+  --output_dir models \
+  --epochs 20 \
+  --loss_type focal \
+  --mine_hard_negatives \
+  --hard_negative_threshold 0.5 \
+  --hard_negative_duplicate 3 \
+  --second_phase_epochs 10 \
+  --device auto
+
+Fine-tune from an existing checkpoint (optional)
+- python binary_classifier.py \
+  --dataset_dir output/dataset \
+  --output_dir models_finetuned \
+  --pretrained models/walnut_classifier_best_precision.pth \
+  --learning_rate 0.0003 \
+  --epochs 25 \
+  --loss_type focal \
+  --mine_hard_negatives \
+  --hard_negative_threshold 0.5 \
+  --hard_negative_duplicate 3 \
+  --second_phase_epochs 20 \
+  --patch_size 32 \
+  --device auto
+
+Parameter sweep (run after training; use phase1.pth if best_precision is missing)
+- python parameter_sweep_binary.py \
+    --model_path models/walnut_classifier_phase1.pth \
+    --image_dir output \
+    --annotation_dir output/annotations \
+    --split_file output/dataset/split.json \
+    --split test \
+    --device auto
+- python parameter_sweep_binary.py --quick   # fewer combos, faster
+
+
+Extract walnut cutouts (creates walnut_cutouts/ under --output_dir)
+- python extract_walnuts.py --train_dir output/dataset/train --output_dir output/dataset
+
+Optimize synthetic config (Optuna; pass cutouts + negatives explicitly)
+- python optimize_synthetic_config.py \
+    --cutouts_dir output/dataset/walnut_cutouts \
+    --neg_dir output/dataset/train/negative \
+    --w0_path models/walnut_classifier_phase1.pth \
+    --image_dir output \
+    --annotation_dir output/annotations \
+    --split_file output/dataset/split.json \
+    --n_trials 10 --device auto
+
+Or repo-root layout after extract_walnuts.py --train_dir train --output_dir .
+- python optimize_synthetic_config.py \
+    --cutouts_dir walnut_cutouts \
+    --neg_dir train/negative \
+    --w0_path models/walnut_classifier_phase1.pth \
+    --n_trials 10 --device auto
+
+best optima synthetic configuration 
+- python optimize_synthetic_config.py \
+  --cutouts_dir walnut_cutouts \
+  --neg_dir train/negative \
+  --w0_path models/walnut_classifier_phase1.pth \
+  --n_trials 10 \
+  --device auto
+
+Build YOLO tiled dataset from real images + best_config.json (640×640 tiles)
+- python build_yolo_tiled_dataset.py \
+    --config optuna_results/best_config.json \
+    --image_dir output \
+    --annotation_dir output/annotations \
+    --split_file output/dataset/split.json \
+    --out_dir yolo_walnut_tiled
+
+Random number of tiles (sample with replacement if N > unique grid cells):
+- python build_yolo_tiled_dataset.py --config optuna_results/best_config.json --num_tiles 500
+- python build_yolo_tiled_dataset.py --config optuna_results/best_config.json --num_tiles_min 200 --num_tiles_max 800
+
+Train YOLO model 
+- python train_yolov8_synthetic.py \
+  --data_dir yolo_walnut_tiled \
+  --imgsz 640 \
+  --epochs 100 \
+  --device auto
+
+Run the 2 stage hybrid model (classifier thresholds from binary sweep)
+- python "evaluate_yolo_two_stage copy.py" \
+    --yolo_model_path yolo_runs/walnut_synthetic-3/weights/best.pt \
+    --clf_model_path models/walnut_classifier_phase1.pth \
+    --image_dir output \
+    --annotation_dir output/annotations \
+    --split_file output/dataset/split.json \
+    --sweep_results binary_parameter_sweep_results.json \
+    --sweep_metric mae \
+    --split test \
+    --device auto
+
+Use best F1 sweep config instead of best MAE:
+- python "evaluate_yolo_two_stage copy.py" ... --sweep_metric f1
+
+
+

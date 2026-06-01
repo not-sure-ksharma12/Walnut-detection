@@ -16,7 +16,11 @@ Prerequisites:
 How to run:
   cd Walnut-detection
   source venv/bin/activate
-  python generate_yolo_synthetic_dataset.py --mode patch --num_images 5000
+  python generate_yolo_synthetic_dataset.py \\
+    --config optuna_results/best_config.json \\
+    --cutouts_dir output/dataset/walnut_cutouts \\
+    --neg_dir output/dataset/train/negative \\
+    --mode patch --num_images 5000
   python train_yolov8_synthetic.py --data_dir yolo_walnut_synthetic --imgsz 32
 """
 
@@ -38,6 +42,11 @@ IMG_SIZE = 640
 PATCH = 32
 MIN_WALNUTS = 1
 MAX_WALNUTS = 4
+
+
+def _resolve_path(path: str) -> Path:
+    p = Path(path)
+    return p if p.is_absolute() else WORKSPACE / p
 
 
 def make_background_640(neg_patches, green_bgs):
@@ -210,6 +219,24 @@ def main():
     )
     parser.add_argument("--val_ratio", type=float, default=0.1, help="Fraction of images for val split (0.1 = 10%%)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for compositing and train/val split")
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=str(WORKSPACE / "optuna_results" / "best_config.json"),
+        help="Path to best_config.json from optimize_synthetic_config.py",
+    )
+    parser.add_argument(
+        "--cutouts_dir",
+        type=str,
+        default="output/dataset/walnut_cutouts",
+        help="Directory of RGBA walnut cutout PNGs",
+    )
+    parser.add_argument(
+        "--neg_dir",
+        type=str,
+        default="output/dataset/train/negative",
+        help="Directory of negative background patches (32×32 PNGs)",
+    )
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir) if args.out_dir else WORKSPACE / "yolo_walnut_synthetic"
@@ -221,22 +248,42 @@ def main():
     for d in (images_train, labels_train, images_val, labels_val):
         d.mkdir(parents=True, exist_ok=True)
 
-    config_path = m.STUDY_DIR / "best_config.json"
-    if not config_path.exists():
-        print(f"Missing {config_path}. Run Stage 1 config search first.")
+    config_path = _resolve_path(args.config)
+    if not config_path.is_file():
+        print(f"Missing {config_path}. Run optimize_synthetic_config.py first.")
         sys.exit(1)
     with open(config_path, "r") as f:
         best_cfg = json.load(f)
+    if "best_params" not in best_cfg:
+        print(f"Invalid config file (expected 'best_params'): {config_path}")
+        sys.exit(1)
     config = copy.deepcopy(best_cfg["best_params"])
-    if config["cutout_scale_min"] >= config["cutout_scale_max"]:
+    if config.get("cutout_scale_min", 0) >= config.get("cutout_scale_max", 1):
         config["cutout_scale_max"] = config["cutout_scale_min"] + 0.1
+
+    cutouts_dir = _resolve_path(args.cutouts_dir)
+    neg_dir = _resolve_path(args.neg_dir)
+    if not cutouts_dir.is_dir():
+        print(f"Cutouts directory not found: {cutouts_dir}")
+        sys.exit(1)
+    if not neg_dir.is_dir():
+        print(f"Negative patches directory not found: {neg_dir}")
+        sys.exit(1)
 
     random.seed(args.seed)
     np.random.seed(args.seed)
 
-    cutouts = m.load_cutouts(m.CUTOUTS_DIR)
-    neg_patches = m.load_negative_patches(m.NEG_DIR, m.PATCH_SIZE)
-    print(f"Cutouts: {len(cutouts)}, Negatives: {len(neg_patches)}")
+    cutouts = m.load_cutouts(cutouts_dir)
+    neg_patches = m.load_negative_patches(neg_dir, m.PATCH_SIZE)
+    print(f"Config:    {config_path}")
+    print(f"Cutouts:   {cutouts_dir} ({len(cutouts)} PNGs)")
+    print(f"Negatives: {neg_dir} ({len(neg_patches)} PNGs)")
+    if not cutouts:
+        print("No cutout PNGs found. Run extract_walnuts.py first.")
+        sys.exit(1)
+    if not neg_patches:
+        print("No negative PNGs found. Build dataset first.")
+        sys.exit(1)
 
     if args.mode == "patch":
         if getattr(args, "pos_only", False):

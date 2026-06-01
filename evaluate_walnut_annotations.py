@@ -149,6 +149,7 @@ def evaluate_dataset(
     # Build or reconfigure detector
     if detector is not None:
         detector.reconfigure(
+            patch_size=patch_size,
             stride=stride,
             confidence_threshold=threshold,
             cluster_eps=cluster_eps,
@@ -165,7 +166,6 @@ def evaluate_dataset(
             cluster_eps=cluster_eps,
             local_max_size=local_max_size,
             nms_radius=nms_radius,
-            window_size=window_size,
         )
 
     total_tp, total_fp, total_fn = 0, 0, 0

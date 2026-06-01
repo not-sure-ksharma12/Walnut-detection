@@ -1,0 +1,13 @@
+# Walnut center annotations (x, y) coordinates
+# Image: image_q10.png
+# Image size: 519x482
+# Total walnuts: 8
+# Format: x y
+166 179
+100 204
+112 379
+224 376
+451 281
+463 277
+414 118
+445 65

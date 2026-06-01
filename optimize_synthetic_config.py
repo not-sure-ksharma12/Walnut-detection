@@ -10,15 +10,22 @@ What it does:
 
 Prerequisites:
   - python3 setup.py
-  - walnut_cutouts/, train/negative/, models_finetuned/walnut_classifier_best_precision.pth
-  - cropped_images/, annotated_images/, split.json (for val evaluation)
+  - walnut_cutouts/ (from extract_walnuts.py), train/negative/ (or output/dataset/train/negative/)
+  - A trained .pth for W0 (--w0_path)
+  - Full images, annotations, split.json for val evaluation
   - Optional: cyclegan_models/G_AB_best.pth
 
 How to run:
   cd Walnut-detection
   source venv/bin/activate
-  python optimize_synthetic_config.py --n_trials 100 --device auto
-  python optimize_synthetic_config.py --n_trials 50 --device cuda --resume
+  python optimize_synthetic_config.py \\
+    --cutouts_dir walnut_cutouts \\
+    --neg_dir train/negative \\
+    --w0_path models/walnut_classifier_phase1.pth \\
+    --image_dir output \\
+    --annotation_dir output/annotations \\
+    --split_file output/dataset/split.json \\
+    --n_trials 100 --device auto
 """
 
 import argparse
@@ -30,6 +37,7 @@ import random
 import sys
 import tempfile
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -47,17 +55,34 @@ from torchvision import transforms
 # ---------------------------------------------------------------------------
 WORKSPACE = Path(__file__).resolve().parent
 
-W0_PATH = WORKSPACE / "models_finetuned" / "walnut_classifier_best_precision.pth"
-CUTOUTS_DIR = WORKSPACE / "walnut_cutouts"
-NEG_DIR = WORKSPACE / "train" / "negative"
-CYCLEGAN_CKPT = WORKSPACE / "cyclegan_models" / "G_AB_best.pth"
-
-IMAGE_DIR = WORKSPACE / "cropped_images"
-ANNOTATION_DIR = WORKSPACE / "annotated_images"
-SPLIT_FILE = WORKSPACE / "split.json"
-
 STUDY_DIR = WORKSPACE / "optuna_results"
 LOG_DIR = WORKSPACE / "logs"
+
+
+@dataclass(frozen=True)
+class RunPaths:
+    w0_path: Path
+    cutouts_dir: Path
+    neg_dir: Path
+    image_dir: Path
+    annotation_dir: Path
+    split_file: Path
+    cyclegan_ckpt: Path
+
+
+def _resolve_path(path: str) -> Path:
+    p = Path(path)
+    return p if p.is_absolute() else WORKSPACE / p
+
+
+def _require_dir(path: Path, label: str) -> None:
+    if not path.is_dir():
+        raise SystemExit(f"{label} not found: {path}")
+
+
+def _require_file(path: Path, label: str) -> None:
+    if not path.is_file():
+        raise SystemExit(f"{label} not found: {path}")
 
 # Detection hyper-params (fixed — best config from real-model sweep)
 DET_STRIDE = 16
@@ -346,27 +371,13 @@ def load_w0(w0_path: Path, device: str, freeze_backbone: bool = True) -> WalnutC
     except Exception:
         ckpt = torch.load(w0_path, map_location="cpu", weights_only=False)
 
-    state = ckpt.get("model_state_dict", ckpt)
-
-    # Remap old features.N.* keys if needed
-    new_state = {}
-    block_map = {0: "block1", 1: "block1", 2: "block1", 3: "block1", 4: "block1",
-                 5: "block1", 6: "block1",
-                 7: "block2", 8: "block2", 9: "block2", 10: "block2", 11: "block2",
-                 12: "block2", 13: "block2",
-                 14: "block3", 15: "block3", 16: "block3", 17: "block3", 18: "block3",
-                 19: "block3", 20: "block3",
-                 21: "block4", 22: "block4", 23: "block4", 24: "block4"}
-    for k, v in state.items():
-        new_state[k] = v
-
-    model.load_state_dict(new_state, strict=False)
+    state = ckpt.get("model_state_dict", ckpt.get("state_dict", ckpt))
+    model.load_state_dict(state, strict=False)
     model.to(device)
 
     if freeze_backbone:
-        for block in [model.block1, model.block2, model.block3, model.block4]:
-            for param in block.parameters():
-                param.requires_grad = False
+        for param in model.features.parameters():
+            param.requires_grad = False
 
     return model
 
@@ -431,7 +442,7 @@ def finetune_head(
 # ---------------------------------------------------------------------------
 # Evaluate detector on val split (Option A — full sliding window)
 # ---------------------------------------------------------------------------
-def evaluate_on_val(model: WalnutClassifier, device: str) -> dict:
+def evaluate_on_val(model: WalnutClassifier, device: str, paths: RunPaths) -> dict:
     """Run full detector pipeline on val split and return full metrics dict.
 
     Saves model to a temp file, creates WalnutDetector, runs evaluate_dataset.
@@ -444,9 +455,9 @@ def evaluate_on_val(model: WalnutClassifier, device: str) -> dict:
     try:
         metrics = evaluate_dataset(
             model_path=tmp_path,
-            image_dir=str(IMAGE_DIR),
-            annotation_dir=str(ANNOTATION_DIR),
-            split_file=str(SPLIT_FILE),
+            image_dir=str(paths.image_dir),
+            annotation_dir=str(paths.annotation_dir),
+            split_file=str(paths.split_file),
             split="val",
             patch_size=PATCH_SIZE,
             stride=DET_STRIDE,
@@ -471,7 +482,7 @@ def evaluate_on_val(model: WalnutClassifier, device: str) -> dict:
 # ---------------------------------------------------------------------------
 # Optuna objective
 # ---------------------------------------------------------------------------
-def create_objective(cutouts, neg_patches, cyclegan_G, device, baseline_f1):
+def create_objective(cutouts, neg_patches, cyclegan_G, device, baseline_f1, paths: RunPaths):
 
     def objective(trial: optuna.Trial) -> float:
         t0 = time.time()
@@ -527,7 +538,7 @@ def create_objective(cutouts, neg_patches, cyclegan_G, device, baseline_f1):
         log.debug(f"Positive tensor shape: {pos_tensor.shape}")
 
         # --- Load W0 FRESH (always reset — never carry across trials) ---
-        model = load_w0(W0_PATH, device, freeze_backbone=True)
+        model = load_w0(paths.w0_path, device, freeze_backbone=True)
         log.debug("Loaded W0 fresh (backbone frozen)")
 
         # --- Fine-tune head ---
@@ -540,7 +551,7 @@ def create_objective(cutouts, neg_patches, cyclegan_G, device, baseline_f1):
 
         # --- Evaluate on val (full detector, Option A) ---
         t_eval = time.time()
-        metrics = evaluate_on_val(model, device)
+        metrics = evaluate_on_val(model, device, paths)
         eval_time = time.time() - t_eval
         f1 = metrics["f1"]
         precision = metrics["precision"]
@@ -598,6 +609,48 @@ def main():
     from device_utils import add_device_argument, resolve_device
 
     parser.add_argument("--n_trials", type=int, default=100, help="Number of Optuna trials to run")
+    parser.add_argument(
+        "--cutouts_dir",
+        type=str,
+        default="walnut_cutouts",
+        help="Directory of RGBA walnut cutout PNGs (from extract_walnuts.py)",
+    )
+    parser.add_argument(
+        "--neg_dir",
+        type=str,
+        default="train/negative",
+        help="Directory of negative background patches (32×32 PNGs)",
+    )
+    parser.add_argument(
+        "--w0_path",
+        type=str,
+        default="models/walnut_classifier_phase1.pth",
+        help="Base classifier checkpoint (W0) to fine-tune each trial",
+    )
+    parser.add_argument(
+        "--image_dir",
+        type=str,
+        default="output",
+        help="Full images for val detection evaluation",
+    )
+    parser.add_argument(
+        "--annotation_dir",
+        type=str,
+        default="output/annotations",
+        help="Annotation .txt files for val evaluation",
+    )
+    parser.add_argument(
+        "--split_file",
+        type=str,
+        default="output/dataset/split.json",
+        help="split.json with train/val/test stems",
+    )
+    parser.add_argument(
+        "--cyclegan_ckpt",
+        type=str,
+        default="cyclegan_models/G_AB_best.pth",
+        help="Optional CycleGAN generator checkpoint (skipped if missing)",
+    )
     add_device_argument(
         parser,
         default="auto",
@@ -612,6 +665,22 @@ def main():
     args = parser.parse_args()
     args.device = resolve_device(args.device)
 
+    paths = RunPaths(
+        w0_path=_resolve_path(args.w0_path),
+        cutouts_dir=_resolve_path(args.cutouts_dir),
+        neg_dir=_resolve_path(args.neg_dir),
+        image_dir=_resolve_path(args.image_dir),
+        annotation_dir=_resolve_path(args.annotation_dir),
+        split_file=_resolve_path(args.split_file),
+        cyclegan_ckpt=_resolve_path(args.cyclegan_ckpt),
+    )
+    _require_file(paths.w0_path, "W0 checkpoint")
+    _require_dir(paths.cutouts_dir, "Cutouts directory (--cutouts_dir)")
+    _require_dir(paths.neg_dir, "Negative patches directory (--neg_dir)")
+    _require_file(paths.split_file, "Split file")
+    _require_dir(paths.image_dir, "Image directory")
+    _require_dir(paths.annotation_dir, "Annotation directory")
+
     STUDY_DIR.mkdir(parents=True, exist_ok=True)
     db_path = STUDY_DIR / "study.db"
 
@@ -624,13 +693,13 @@ def main():
     log.info("=" * 70)
     log.info("  Stage 1: Synthetic Config Search")
     log.info("=" * 70)
-    log.info(f"  W0:           {W0_PATH}")
-    log.info(f"  Cutouts dir:  {CUTOUTS_DIR}")
-    log.info(f"  Negatives:    {NEG_DIR}")
-    log.info(f"  CycleGAN:     {CYCLEGAN_CKPT}")
-    log.info(f"  Images:       {IMAGE_DIR}")
-    log.info(f"  Annotations:  {ANNOTATION_DIR}")
-    log.info(f"  Split file:   {SPLIT_FILE}")
+    log.info(f"  W0:           {paths.w0_path}")
+    log.info(f"  Cutouts dir:  {paths.cutouts_dir}")
+    log.info(f"  Negatives:    {paths.neg_dir}")
+    log.info(f"  CycleGAN:     {paths.cyclegan_ckpt}")
+    log.info(f"  Images:       {paths.image_dir}")
+    log.info(f"  Annotations:  {paths.annotation_dir}")
+    log.info(f"  Split file:   {paths.split_file}")
     log.info(f"  Detection:    stride={DET_STRIDE} thresh={DET_THRESH} "
              f"eps={DET_EPS} nms={DET_NMS} lms={DET_LMS} match_r={DET_MATCH_RADIUS}")
     log.info(f"  Fine-tune:    lr={FT_LR} steps={FT_STEPS} batch={FT_BATCH}")
@@ -642,23 +711,33 @@ def main():
 
     # --- Preload everything ---
     log.info("Loading assets...")
-    cutouts = load_cutouts(CUTOUTS_DIR)
+    cutouts = load_cutouts(paths.cutouts_dir)
     log.info(f"  Cutouts: {len(cutouts)}")
+    if not cutouts:
+        raise SystemExit(
+            f"No cutout PNGs in {paths.cutouts_dir}. "
+            "Run: python extract_walnuts.py --train_dir <dataset>/train --output_dir <parent>"
+        )
 
-    neg_patches = load_negative_patches(NEG_DIR, PATCH_SIZE)
+    neg_patches = load_negative_patches(paths.neg_dir, PATCH_SIZE)
     log.info(f"  Negatives: {len(neg_patches)}")
+    if not neg_patches:
+        raise SystemExit(
+            f"No negative PNGs in {paths.neg_dir}. "
+            "Build dataset first: python build_annotations11_10_dataset.py ..."
+        )
 
     cyclegan_G = None
-    if CYCLEGAN_CKPT.exists():
-        cyclegan_G = load_cyclegan(CYCLEGAN_CKPT, args.device)
+    if paths.cyclegan_ckpt.exists():
+        cyclegan_G = load_cyclegan(paths.cyclegan_ckpt, args.device)
         log.info(f"  CycleGAN: loaded")
     else:
         log.info(f"  CycleGAN: not found, will skip refinement")
 
     # --- Baseline: W0 without any fine-tuning ---
     log.info("Computing baseline (W0 unmodified on val)...")
-    baseline_model = load_w0(W0_PATH, args.device, freeze_backbone=False)
-    baseline_metrics = evaluate_on_val(baseline_model, args.device)
+    baseline_model = load_w0(paths.w0_path, args.device, freeze_backbone=False)
+    baseline_metrics = evaluate_on_val(baseline_model, args.device, paths)
     del baseline_model
     baseline_f1 = baseline_metrics["f1"]
     log.info(f"  BASELINE: P={baseline_metrics['precision']:.4f} "
@@ -685,7 +764,9 @@ def main():
             load_if_exists=True,
         )
 
-    objective = create_objective(cutouts, neg_patches, cyclegan_G, args.device, baseline_f1)
+    objective = create_objective(
+        cutouts, neg_patches, cyclegan_G, args.device, baseline_f1, paths
+    )
 
     log.info(f"\nStarting search ({args.n_trials} trials)...\n")
     study.optimize(objective, n_trials=args.n_trials, show_progress_bar=False)
@@ -741,13 +822,15 @@ def main():
     log.info(f"\n  Top 10 configs:")
     log.info(header)
     log.info("  " + "-" * 100)
-    sorted_trials = sorted(study.trials, key=lambda t: t.value or 0, reverse=True)
+    completed_trials = [t for t in study.trials if t.value is not None]
+    sorted_trials = sorted(completed_trials, key=lambda t: t.value, reverse=True)
     for t in sorted_trials[:10]:
         p = t.params
         ua = t.user_attrs
-        delta = ua.get("delta_vs_baseline", (t.value or 0) - baseline_f1)
+        f1 = t.value or 0.0
+        delta = ua.get("delta_vs_baseline", f1 - baseline_f1)
         log.info(
-            f"  {t.number:>3}  {t.value:>7.4f}  "
+            f"  {t.number:>3}  {f1:>7.4f}  "
             f"{ua.get('precision',0):>6.3f}  {ua.get('recall',0):>6.3f}  "
             f"{ua.get('mae',0):>5.1f}  {delta:>+7.4f}  "
             f"{str(p.get('use_cyclegan','')):>8}  "

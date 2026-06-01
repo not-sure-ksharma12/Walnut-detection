@@ -1,36 +1,46 @@
 #!/usr/bin/env python3
 """
-evaluate_yolo_two_stage.py — Evaluate YOLO proposals + patch classifier on annotated images.
+Two-stage walnut detection: YOLOv8 tiled proposals + patch classifier filter.
 
-What it does:
-  - Stage 1: Tile images, run YOLOv8, merge boxes with global NMS
-  - Stage 2: Crop patches at each proposal, filter with binary classifier
-  - Matches detections to GT centres; reports precision, recall, F1, MAE
+Stage 1 (YOLO):
+  - Slide a window (tile_size, stride) over each full image.
+  - Run YOLOv8 on each tile.
+  - Map detections back to full-image coordinates.
+  - Run global NMS over all proposals for that image.
 
-Prerequisites:
-  - python3 setup.py
-  - YOLO .pt weights, classifier .pth, cropped_images/, annotated_images/, split.json
+Stage 2 (patch classifier):
+  - For each YOLO proposal box, crop a small patch around its center.
+  - Run the binary walnut classifier (same as WalnutDetector uses).
+  - Keep only proposals where classifier probability >= clf_conf.
 
-How to run:
+Evaluation:
+  - Convert kept boxes to centres.
+  - Match centres to ground-truth walnut centres using match_detections
+    (Hungarian + radius).
+  - Report per-image GT/Det/TP/FP/FN and global precision/recall/F1/MAE.
+
+Usage example:
   cd Walnut-detection
   source venv/bin/activate
-  python evaluate_yolo_two_stage.py \\
-    --yolo_model_path yolo_runs/walnut_synthetic/weights/best.pt \\
-    --clf_model_path optuna_results/w0_option_b.pth \\
-    --image_dir cropped_images \\
-    --annotation_dir annotated_images \\
-    --split_file split.json \\
-    --split test --device auto
+  python "evaluate_yolo_two_stage copy.py" \\
+    --yolo_model_path yolo_runs/walnut_synthetic-3/weights/best.pt \\
+    --clf_model_path models/walnut_classifier_phase1.pth \\
+    --image_dir output \\
+    --annotation_dir output/annotations \\
+    --split_file output/dataset/split.json \\
+    --split test \\
+    --device auto
 """
 
 import argparse
 import json
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import cv2
 import numpy as np
 
+from device_utils import add_device_argument, resolve_device, ultralytics_device
 from evaluate_walnut_annotations import (
     parse_annotations,
     match_detections,
@@ -42,6 +52,37 @@ from walnut_detector import WalnutDetector
 WORKSPACE = Path(__file__).resolve().parent
 DEFAULT_TILE_SIZE = 640
 DEFAULT_STRIDE = 480
+DEFAULT_MATCH_RADIUS = 48.0
+
+
+def load_binary_sweep_params(results_path: Path, metric: str = "mae") -> Dict[str, float]:
+    """Load best patch_size / stride / threshold from parameter_sweep_binary.py output."""
+    if not results_path.is_file():
+        raise SystemExit(f"Sweep results not found: {results_path}")
+    with open(results_path) as f:
+        data = json.load(f)
+    key = "best_by_mae" if metric == "mae" else "best_by_f1"
+    best = data.get(key)
+    if not best:
+        raise SystemExit(f"Missing '{key}' in {results_path}")
+    return best
+
+
+def apply_sweep_to_args(args, sweep: Dict[str, float]) -> None:
+    """Map binary sweep fields onto two-stage classifier / eval settings."""
+    args.clf_conf = float(sweep["threshold"])
+    args.clf_patch_size = int(sweep["patch_size"])
+    args.clf_window_size = int(sweep["patch_size"])
+    args.match_radius = DEFAULT_MATCH_RADIUS
+    print(
+        f"Binary sweep ({args.sweep_metric}): "
+        f"patch_size={args.clf_patch_size} stride={sweep['stride']} "
+        f"threshold={args.clf_conf} match_radius={args.match_radius}"
+    )
+    print(
+        f"  (sweep stride={sweep['stride']} is for sliding-window detector; "
+        f"YOLO tiling still uses --tile_size/--stride)"
+    )
 
 
 def tile_positions(img_dim: int, tile_size: int, stride: int) -> List[int]:
@@ -157,7 +198,7 @@ class WalnutPatchClassifier:
         self.detector = WalnutDetector(
             model_path=model_path,
             patch_size=patch_size,
-            stride=patch_size,  # not used here
+            stride=patch_size,
             confidence_threshold=0.5,
             device=device,
             cluster_eps=24.0,
@@ -213,22 +254,18 @@ def evaluate_two_stage(
     yolo_conf: float = 0.20,
     yolo_iou: float = 0.40,
     clf_conf: float = 0.60,
+    clf_patch_size: int = 32,
     clf_window_size: int = 32,
     nms_iou: float = 0.40,
-    match_radius: float = 64.0,
+    match_radius: float = DEFAULT_MATCH_RADIUS,
     device: str = "auto",
     verbose: bool = True,
 ) -> Dict:
     """Evaluate two-stage YOLO + classifier on a split of full images."""
     from ultralytics import YOLO
 
-    from device_utils import resolve_device, ultralytics_device
-
     device = resolve_device(device)
     yolo_device = ultralytics_device(device)
-    if verbose:
-        print(f"Device: {device} (YOLO: {yolo_device})")
-
     image_dir_p = Path(image_dir)
     annotation_dir_p = Path(annotation_dir)
     split_file_p = Path(split_file)
@@ -259,7 +296,7 @@ def evaluate_two_stage(
     yolo_model = YOLO(yolo_model_path)
     clf = WalnutPatchClassifier(
         model_path=clf_model_path,
-        patch_size=32,
+        patch_size=clf_patch_size,
         device=device,
     )
 
@@ -376,19 +413,19 @@ def main() -> None:
     parser.add_argument(
         "--image_dir",
         type=str,
-        default=str(WORKSPACE / "cropped_images"),
+        default=str(WORKSPACE / "output"),
         help="Directory with full images",
     )
     parser.add_argument(
         "--annotation_dir",
         type=str,
-        default=str(WORKSPACE / "annotated_images"),
+        default=str(WORKSPACE / "output" / "annotations"),
         help="Directory with annotation .txt files",
     )
     parser.add_argument(
         "--split_file",
         type=str,
-        default=str(WORKSPACE / "split.json"),
+        default=str(WORKSPACE / "output" / "dataset" / "split.json"),
         help="Path to split.json",
     )
     parser.add_argument(
@@ -396,7 +433,6 @@ def main() -> None:
         type=str,
         default="test",
         choices=["train", "val", "test"],
-        help="Which split from split.json to evaluate",
     )
     parser.add_argument(
         "--tile_size",
@@ -450,13 +486,35 @@ def main() -> None:
     parser.add_argument(
         "--match_radius",
         type=float,
-        default=64.0,
+        default=DEFAULT_MATCH_RADIUS,
         help="Matching radius in pixels for detection <-> GT centres",
     )
-    from device_utils import add_device_argument
-
+    parser.add_argument(
+        "--sweep_results",
+        type=str,
+        default=None,
+        help="binary_parameter_sweep_results.json — sets clf_conf, patch/window size, match_radius",
+    )
+    parser.add_argument(
+        "--sweep_metric",
+        type=str,
+        default="mae",
+        choices=["mae", "f1"],
+        help="Use best_by_mae or best_by_f1 from sweep results (default: mae)",
+    )
+    parser.add_argument(
+        "--clf_patch_size",
+        type=int,
+        default=32,
+        help="Classifier input patch size (overridden by --sweep_results)",
+    )
     add_device_argument(parser, default="auto")
     args = parser.parse_args()
+    args.device = resolve_device(args.device)
+
+    if args.sweep_results:
+        sweep = load_binary_sweep_params(Path(args.sweep_results), args.sweep_metric)
+        apply_sweep_to_args(args, sweep)
 
     metrics = evaluate_two_stage(
         yolo_model_path=args.yolo_model_path,
@@ -471,6 +529,7 @@ def main() -> None:
         yolo_conf=args.yolo_conf,
         yolo_iou=args.yolo_iou,
         clf_conf=args.clf_conf,
+        clf_patch_size=args.clf_patch_size,
         clf_window_size=args.clf_window_size,
         nms_iou=args.nms_iou,
         match_radius=args.match_radius,

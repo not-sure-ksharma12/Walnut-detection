@@ -19,15 +19,74 @@ How to run:
   python train_yolov8_synthetic.py --generate --num_images 5000 --epochs 100
 """
 
+import random
+import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import List, Tuple
 
 WORKSPACE = Path(__file__).resolve().parent
 DEFAULT_DATA_DIR = WORKSPACE / "yolo_walnut_synthetic"
 DEFAULT_EPOCHS = 100
 DEFAULT_IMGSZ = 640
 DEFAULT_BATCH = 16
+IMAGE_GLOBS = ("*.jpg", "*.jpeg", "*.png", "*.JPG", "*.JPEG", "*.PNG")
+
+
+def _list_images(folder: Path) -> List[Path]:
+    if not folder.is_dir():
+        return []
+    files: List[Path] = []
+    for pattern in IMAGE_GLOBS:
+        files.extend(folder.glob(pattern))
+    return sorted({p.resolve() for p in files})
+
+
+def ensure_val_split(
+    data_dir: Path,
+    min_val: int = 1,
+    val_fraction: float = 0.1,
+    seed: int = 42,
+) -> Tuple[str, str]:
+    """Ensure images/val is non-empty. Returns (train_rel, val_rel) paths for data.yaml."""
+    train_img = data_dir / "images" / "train"
+    val_img = data_dir / "images" / "val"
+    train_lbl = data_dir / "labels" / "train"
+    val_lbl = data_dir / "labels" / "val"
+    val_img.mkdir(parents=True, exist_ok=True)
+    val_lbl.mkdir(parents=True, exist_ok=True)
+
+    train_files = _list_images(train_img)
+    val_files = _list_images(val_img)
+
+    if len(val_files) >= min_val:
+        return "images/train", "images/val"
+
+    if not train_files:
+        raise SystemExit(f"No training images in {train_img}")
+
+    if len(train_files) == 1:
+        print(
+            "Warning: only one training image; YOLO val will reuse images/train "
+            "(not ideal, but required by ultralytics)."
+        )
+        return "images/train", "images/train"
+
+    rng = random.Random(seed)
+    n_move = max(min_val, int(round(len(train_files) * val_fraction)))
+    n_move = min(n_move, len(train_files) - 1)
+    to_move = rng.sample(train_files, n_move)
+    for src in to_move:
+        shutil.move(str(src), str(val_img / src.name))
+        lbl_src = train_lbl / f"{src.stem}.txt"
+        lbl_dst = val_lbl / f"{src.stem}.txt"
+        if lbl_src.exists():
+            shutil.move(str(lbl_src), str(lbl_dst))
+        else:
+            lbl_dst.write_text("", encoding="utf-8")
+    print(f"Moved {n_move} image(s) from train → val (val folder was empty)")
+    return "images/train", "images/val"
 
 
 def main():
@@ -85,16 +144,30 @@ def main():
             print("Dataset generation failed.")
             sys.exit(1)
 
-    # data.yaml (YOLO format: path, train, val, nc, names)
+    train_rel, val_rel = ensure_val_split(data_dir)
+    n_train = len(_list_images(data_dir / train_rel))
+    n_val = len(_list_images(data_dir / val_rel))
+    print(f"Dataset: {n_train} train, {n_val} val images")
+
+    if n_train < 1 or n_val < 1:
+        raise SystemExit("Need at least one train and one val image for YOLO training.")
+
+    batch = min(args.batch, max(1, n_train))
+    if batch < args.batch:
+        print(f"Reduced batch size {args.batch} → {batch} (small train set)")
+
     data_yaml = data_dir / "data.yaml"
-    data_yaml.write_text(f"""# Walnut synthetic dataset (best config)
+    data_yaml.write_text(
+        f"""# Walnut YOLO dataset
 path: {data_dir.resolve()}
-train: images/train
-val: images/val
+train: {train_rel}
+val: {val_rel}
 nc: 1
 names:
   0: walnut
-""", encoding="utf-8")
+""",
+        encoding="utf-8",
+    )
     print(f"Wrote {data_yaml}")
 
     imgsz = args.imgsz
@@ -116,7 +189,7 @@ names:
         data=str(data_yaml),
         epochs=args.epochs,
         imgsz=imgsz,
-        batch=args.batch,
+        batch=batch,
         project=args.project,
         name=args.name,
     )

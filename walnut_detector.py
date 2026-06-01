@@ -66,6 +66,40 @@ class WalnutDetector:
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
+
+    def reconfigure(
+        self,
+        *,
+        patch_size: int | None = None,
+        stride: int | None = None,
+        confidence_threshold: float | None = None,
+        cluster_eps: float | None = None,
+        local_max_size: int | None = None,
+        nms_radius: float | None = None,
+    ) -> None:
+        """Update detection hyperparameters without reloading weights."""
+        if patch_size is not None and patch_size != self.patch_size:
+            self.patch_size = patch_size
+            self.transform = transforms.Compose([
+                transforms.ToPILImage(),
+                transforms.Resize((patch_size, patch_size)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ])
+        if stride is not None:
+            self.stride = stride
+        if confidence_threshold is not None:
+            self.confidence_threshold = confidence_threshold
+        if cluster_eps is not None:
+            self.cluster_eps = cluster_eps
+        if local_max_size is not None:
+            self.local_max_size = (
+                max(3, local_max_size)
+                if local_max_size % 2 == 1
+                else max(3, local_max_size + 1)
+            )
+        if nms_radius is not None:
+            self.nms_radius = max(0.0, nms_radius)
     
     def _load_model(self, model_path: str) -> nn.Module:
         """Load trained model"""
