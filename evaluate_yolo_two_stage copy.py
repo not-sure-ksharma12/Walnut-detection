@@ -23,7 +23,7 @@ Usage example:
   cd Walnut-detection
   source venv/bin/activate
   python "evaluate_yolo_two_stage copy.py" \\
-    --yolo_model_path yolo_runs/walnut_synthetic-3/weights/best.pt \\
+    --yolo_model_path yolo_runs/walnut_synthetic/weights/best.pt \\
     --clf_model_path models/walnut_classifier_phase1.pth \\
     --image_dir output \\
     --annotation_dir output/annotations \\
@@ -53,6 +53,47 @@ WORKSPACE = Path(__file__).resolve().parent
 DEFAULT_TILE_SIZE = 640
 DEFAULT_STRIDE = 480
 DEFAULT_MATCH_RADIUS = 48.0
+DEFAULT_YOLO_MODEL = WORKSPACE / "yolo_runs" / "walnut_synthetic" / "weights" / "best.pt"
+
+
+def resolve_model_path(path: str) -> Path:
+    p = Path(path)
+    return p if p.is_absolute() else WORKSPACE / p
+
+
+def find_latest_yolo_best() -> Path | None:
+    """Most recently modified best.pt under yolo_runs/*/weights/."""
+    candidates = sorted(
+        WORKSPACE.glob("yolo_runs/*/weights/best.pt"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    return candidates[0] if candidates else None
+
+
+def resolve_yolo_model_path(path: str | None) -> Path:
+    if path:
+        resolved = resolve_model_path(path)
+        if resolved.is_file():
+            return resolved
+        fallback = find_latest_yolo_best()
+        if fallback is not None:
+            print(f"⚠️  YOLO model not found: {resolved}")
+            print(f"   Using latest: {fallback}")
+            return fallback
+        raise SystemExit(
+            f"YOLO model not found: {resolved}\n"
+            f"Train first: python train_yolov8_synthetic.py --data_dir yolo_walnut_tiled\n"
+            f"Or pass --yolo_model_path yolo_runs/walnut_synthetic/weights/best.pt"
+        )
+    fallback = find_latest_yolo_best()
+    if fallback is not None:
+        print(f"Using YOLO model: {fallback}")
+        return fallback
+    raise SystemExit(
+        "No YOLO weights found under yolo_runs/*/weights/best.pt. "
+        "Run train_yolov8_synthetic.py first."
+    )
 
 
 def load_binary_sweep_params(results_path: Path, metric: str = "mae") -> Dict[str, float]:
@@ -402,8 +443,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--yolo_model_path",
-        required=True,
-        help="Path to YOLO .pt model (e.g. walnut_tiled_from_synth_freeze/weights/best.pt)",
+        type=str,
+        default=None,
+        help="Path to YOLO .pt (default: latest yolo_runs/*/weights/best.pt)",
     )
     parser.add_argument(
         "--clf_model_path",
@@ -513,11 +555,15 @@ def main() -> None:
     args.device = resolve_device(args.device)
 
     if args.sweep_results:
-        sweep = load_binary_sweep_params(Path(args.sweep_results), args.sweep_metric)
+        sweep = load_binary_sweep_params(
+            resolve_model_path(args.sweep_results), args.sweep_metric
+        )
         apply_sweep_to_args(args, sweep)
 
+    yolo_model_path = resolve_yolo_model_path(args.yolo_model_path)
+
     metrics = evaluate_two_stage(
-        yolo_model_path=args.yolo_model_path,
+        yolo_model_path=str(yolo_model_path),
         clf_model_path=args.clf_model_path,
         image_dir=args.image_dir,
         annotation_dir=args.annotation_dir,
