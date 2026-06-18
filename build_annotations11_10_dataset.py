@@ -75,6 +75,7 @@ def build_dataset(
     n_train: int | None = None,
     n_val: int | None = None,
     n_test: int | None = None,
+    split_json: str | None = None,
     clean: bool = False,
 ) -> None:
     random.seed(seed)
@@ -101,40 +102,77 @@ def build_dataset(
     if not image_files:
         raise SystemExit(f"No images in {image_dir}")
 
-    # Image-level split: train / val / test
-    random.shuffle(image_files)
+    stem_to_path = {p.stem: p for p in image_files}
     n = len(image_files)
 
-    use_fixed_counts = n_train is not None and n_val is not None and n_test is not None
-    if use_fixed_counts:
-        if n_train + n_val + n_test != n:
+    if split_json:
+        split_json_path = Path(split_json)
+        if not split_json_path.exists():
+            raise SystemExit(f"split_json not found: {split_json_path}")
+        with split_json_path.open() as f:
+            predefined = json.load(f)
+
+        train_files, val_files, test_files = set(), set(), set()
+        for split_name, target in (
+            ("train", train_files),
+            ("val", val_files),
+            ("test", test_files),
+        ):
+            for stem in predefined.get(split_name, []):
+                if stem not in stem_to_path:
+                    raise SystemExit(
+                        f"Stem '{stem}' in split_json {split_name} not found under {image_dir}"
+                    )
+                target.add(stem_to_path[stem])
+
+        assigned = train_files | val_files | test_files
+        missing = set(stem_to_path) - {p.stem for p in assigned}
+        if missing:
             raise SystemExit(
-                f"--n_train + --n_val + --n_test must equal number of images ({n}), "
-                f"got {n_train} + {n_val} + {n_test} = {n_train + n_val + n_test}"
+                f"split_json does not assign {len(missing)} image(s), e.g. {sorted(missing)[:3]}"
             )
-        n_train_n, n_val_n, n_test_n = n_train, n_val, n_test
-        print(f"📊 Fixed split: {n_train_n} train, {n_val_n} val, {n_test_n} test (of {n} images)")
+        print(
+            f"📊 Predefined split: {len(train_files)} train, "
+            f"{len(val_files)} val, {len(test_files)} test (of {n} images)"
+        )
+        split_record = {
+            "train": [p.stem for p in sorted(train_files)],
+            "val": [p.stem for p in sorted(val_files)],
+            "test": [p.stem for p in sorted(test_files)],
+        }
     else:
-        n_train_n = max(1, int(n * train_ratio))
-        n_val_n = max(0, int(n * val_ratio))
-        n_test_n = n - n_train_n - n_val_n
-        if n_test_n < 0:
-            n_test_n = 0
-            n_val_n = n - n_train_n
-        print(f"📊 Ratio split: {n_train_n} train, {n_val_n} val, {n_test_n} test (of {n} images)")
+        # Image-level split: train / val / test
+        random.shuffle(image_files)
 
-    train_files = set(image_files[:n_train_n])
-    val_files = set(image_files[n_train_n : n_train_n + n_val_n])
-    test_files = set(image_files[n_train_n + n_val_n :])
+        use_fixed_counts = n_train is not None and n_val is not None and n_test is not None
+        if use_fixed_counts:
+            if n_train + n_val + n_test != n:
+                raise SystemExit(
+                    f"--n_train + --n_val + --n_test must equal number of images ({n}), "
+                    f"got {n_train} + {n_val} + {n_test} = {n_train + n_val + n_test}"
+                )
+            n_train_n, n_val_n, n_test_n = n_train, n_val, n_test
+            print(f"📊 Fixed split: {n_train_n} train, {n_val_n} val, {n_test_n} test (of {n} images)")
+        else:
+            n_train_n = max(1, int(n * train_ratio))
+            n_val_n = max(0, int(n * val_ratio))
+            n_test_n = n - n_train_n - n_val_n
+            if n_test_n < 0:
+                n_test_n = 0
+                n_val_n = n - n_train_n
+            print(f"📊 Ratio split: {n_train_n} train, {n_val_n} val, {n_test_n} test (of {n} images)")
 
-    # Save split (stems only) so evaluator can run on test set only
-    split_json = {
-        "train": [p.stem for p in sorted(train_files)],
-        "val": [p.stem for p in sorted(val_files)],
-        "test": [p.stem for p in sorted(test_files)],
-    }
+        train_files = set(image_files[:n_train_n])
+        val_files = set(image_files[n_train_n : n_train_n + n_val_n])
+        test_files = set(image_files[n_train_n + n_val_n :])
+        split_record = {
+            "train": [p.stem for p in sorted(train_files)],
+            "val": [p.stem for p in sorted(val_files)],
+            "test": [p.stem for p in sorted(test_files)],
+        }
+
     with (output_dir / "split.json").open("w") as f:
-        json.dump(split_json, f, indent=2)
+        json.dump(split_record, f, indent=2)
     print(f"📄 Saved {output_dir / 'split.json'} (train/val/test stems)")
 
     splits = {
@@ -235,6 +273,11 @@ def main():
     parser.add_argument("--n_train", type=int, default=None, help="Exact number of images for train (requires --n_val and --n_test)")
     parser.add_argument("--n_val", type=int, default=None, help="Exact number of images for val")
     parser.add_argument("--n_test", type=int, default=None, help="Exact number of images for test")
+    parser.add_argument(
+        "--split_json",
+        default=None,
+        help="Use existing split.json (train/val/test stems) instead of random shuffling",
+    )
     parser.add_argument("--clean", action="store_true", help="Delete existing train/val/test folders before rebuilding")
     parser.add_argument("--neg_per_positive", type=float, default=2.0, help="Target negatives per image = neg_per_positive * num_positives")
     parser.add_argument("--neg_min_distance", type=float, default=24.0, help="Min distance from negative patch center to any GT center (px)")
@@ -260,6 +303,7 @@ def main():
         n_train=args.n_train,
         n_val=args.n_val,
         n_test=args.n_test,
+        split_json=args.split_json,
         clean=args.clean,
     )
 

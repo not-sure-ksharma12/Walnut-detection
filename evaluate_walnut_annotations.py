@@ -16,19 +16,29 @@ How to run:
   cd Walnut-detection
   source venv/bin/activate
   python evaluate_walnut_annotations.py \\
-    --model_path optuna_results/w0_option_b.pth \\
-    --image_dir cropped_images \\
-    --annotation_dir annotated_images \\
-    --split_file split.json \\
-    --split test --device auto
+    --model_path models/glenn/walnut_classifier_phase1.pth \\
+    --image_dir InputData/GlennDormancyRootstock/cropped_images \\
+    --annotation_dir InputData/GlennDormancyRootstock/annotated_images \\
+    --split_file InputData/GlennDormancyRootstock/dataset/split.json \\
+    --split test \\
+    --sweep_results InputData/GlennDormancyRootstock/binary_parameter_sweep_results_Glenn.json \\
+    --dataset_name Glenn \\
+    --device auto
+
+  Opens red-box overlays from detection_visualizations_Glenn/overlays/
+  Coordinates in detection_visualizations_Glenn/coordinates/*.txt
 """
 
 import argparse
 import json
 import os
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
+WORKSPACE = Path(__file__).resolve().parent
+
+import cv2
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
@@ -92,6 +102,89 @@ def match_detections(
 
 
 # ---------------------------------------------------------------------------
+# Detection visualization (red boxes + coordinate files)
+# ---------------------------------------------------------------------------
+
+def center_to_box(x: int, y: int, box_size: int) -> Tuple[int, int, int, int]:
+    """Convert center (x, y) to axis-aligned box x1,y1,x2,y2 (inclusive)."""
+    half = box_size // 2
+    return x - half, y - half, x + half, y + half
+
+
+def save_detection_visualization(
+    image_path: str,
+    centers: List[Tuple[int, int]],
+    confidences: List[float],
+    output_dir: Path,
+    stem: str,
+    box_size: int = 48,
+) -> Dict[str, str]:
+    """Save red-box overlay JPG and a coordinates .txt for one image."""
+    image = cv2.imread(image_path)
+    if image is None:
+        raise ValueError(f"Could not load image: {image_path}")
+
+    h, w = image.shape[:2]
+    overlay = image.copy()
+
+    coords_dir = output_dir / "coordinates"
+    overlays_dir = output_dir / "overlays"
+    coords_dir.mkdir(parents=True, exist_ok=True)
+    overlays_dir.mkdir(parents=True, exist_ok=True)
+
+    txt_path = coords_dir / f"{stem}.txt"
+    lines = [
+        "# Model walnut detections (binary classifier sliding window)",
+        f"# Image: {stem}",
+        f"# Box size: {box_size} px (square centered on each detection)",
+        "# Format: x_center y_center confidence x1 y1 x2 y2",
+    ]
+
+    red = (0, 0, 255)  # BGR
+    for (x, y), conf in zip(centers, confidences):
+        x1, y1, x2, y2 = center_to_box(x, y, box_size)
+        x1c = max(0, min(x1, w - 1))
+        y1c = max(0, min(y1, h - 1))
+        x2c = max(0, min(x2, w - 1))
+        y2c = max(0, min(y2, h - 1))
+        cv2.rectangle(overlay, (x1c, y1c), (x2c, y2c), red, 2)
+        label = f"{conf:.2f}"
+        cv2.putText(
+            overlay, label, (x1c, max(12, y1c - 4)),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.45, red, 1, cv2.LINE_AA,
+        )
+        lines.append(f"{x} {y} {conf:.4f} {x1c} {y1c} {x2c} {y2c}")
+
+    cv2.putText(
+        overlay, f"Detections: {len(centers)}", (10, 28),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.9, red, 2, cv2.LINE_AA,
+    )
+
+    overlay_path = overlays_dir / f"{stem}_detections.jpg"
+    cv2.imwrite(str(overlay_path), overlay)
+    txt_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    return {
+        "overlay": str(overlay_path),
+        "coordinates": str(txt_path),
+    }
+
+
+def load_sweep_detector_params(results_path: str, metric: str = "mae") -> Dict[str, Any]:
+    """Load best patch_size / stride / threshold from parameter_sweep_binary.py output."""
+    path = Path(results_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"Sweep results not found: {path}")
+    with path.open() as f:
+        data = json.load(f)
+    key = "best_by_mae" if metric == "mae" else "best_by_f1"
+    best = data.get(key)
+    if not best:
+        raise KeyError(f"Missing '{key}' in {path}")
+    return best
+
+
+# ---------------------------------------------------------------------------
 # Core evaluation
 # ---------------------------------------------------------------------------
 
@@ -113,6 +206,8 @@ def evaluate_dataset(
     verbose: bool = True,
     detector: "WalnutDetector | None" = None,
     window_size: int = None,
+    visualize_dir: str | None = None,
+    box_size: int = 48,
 ) -> Optional[Dict]:
     """Run detector on a split and return aggregated metrics dict.
 
@@ -171,6 +266,9 @@ def evaluate_dataset(
     total_tp, total_fp, total_fn = 0, 0, 0
     count_errors = []
     per_image = []
+    vis_root = Path(visualize_dir) if visualize_dir else None
+    if vis_root:
+        vis_root.mkdir(parents=True, exist_ok=True)
 
     for stem in valid_stems:
         img_path = str(_find_image(image_dir_p, stem))
@@ -179,6 +277,7 @@ def evaluate_dataset(
         gt = parse_annotations(ann_path)
         results = detector.process_image(img_path, output_dir=None, cluster=cluster)
         detections = results["centers"]
+        confidences = results["confidences"]
 
         tp, fp, fn = match_detections(detections, gt, match_radius)
         total_tp += tp
@@ -186,12 +285,23 @@ def evaluate_dataset(
         total_fn += fn
         count_errors.append(abs(len(detections) - len(gt)))
 
-        per_image.append({
+        row: Dict[str, Any] = {
             "stem": stem,
             "gt_count": len(gt),
             "det_count": len(detections),
             "tp": tp, "fp": fp, "fn": fn,
-        })
+        }
+
+        if vis_root:
+            paths = save_detection_visualization(
+                img_path, detections, confidences, vis_root, stem, box_size=box_size,
+            )
+            row["overlay_path"] = paths["overlay"]
+            row["coordinates_path"] = paths["coordinates"]
+            if verbose:
+                print(f"  💾 {stem}: overlay + coordinates saved")
+
+        per_image.append(row)
 
         if verbose:
             print(
@@ -231,6 +341,80 @@ def _find_image(image_dir: Path, stem: str) -> Optional[Path]:
         if p.exists():
             return p
     return None
+
+
+def _infer_dataset_name(image_dir: str) -> str:
+    """Derive a dataset label from the image directory path."""
+    p = Path(image_dir)
+    if p.name.lower() in ("cropped_images", "cropped", "images", "output"):
+        return p.parent.name
+    return p.name
+
+
+def _default_output_path(dataset_name: str, split: str) -> Path:
+    """evaluation_results_{dataset}_{split}.json in repo root."""
+    safe_name = dataset_name.replace(" ", "_")
+    if split == "test":
+        return WORKSPACE / f"evaluation_results_{safe_name}.json"
+    return WORKSPACE / f"evaluation_results_{safe_name}_{split}.json"
+
+
+def _format_summary_text(report: Dict[str, Any]) -> str:
+    """Human-readable summary matching the CLI printout."""
+    lines = [
+        "Walnut Detection Evaluation",
+        "=" * 50,
+        f"Dataset:    {report['dataset_name']}",
+        f"Split:      {report['split']}",
+        f"Model:      {report['model_path']}",
+        f"Device:     {report['device']}",
+        f"Timestamp:  {report['timestamp']}",
+        "",
+        "Detector settings:",
+        f"  patch_size={report['detector']['patch_size']}  "
+        f"stride={report['detector']['stride']}  "
+        f"threshold={report['detector']['threshold']}",
+        f"  cluster={report['detector']['cluster']}  "
+        f"cluster_eps={report['detector']['cluster_eps']}  "
+        f"nms_radius={report['detector']['nms_radius']}",
+        f"  match_radius={report['detector']['match_radius']}",
+        "",
+    ]
+    for row in report["metrics"]["per_image"]:
+        lines.append(
+            f"  {row['stem']}: GT={row['gt_count']} Det={row['det_count']} "
+            f"TP={row['tp']} FP={row['fp']} FN={row['fn']}"
+        )
+    m = report["metrics"]
+    lines.extend(
+        [
+            "",
+            f"Summary ({report['split']} split):",
+            f"   Total GT: {m['total_gt']}  Total Det: {m['total_det']}",
+            f"   TP: {m['tp']}  FP: {m['fp']}  FN: {m['fn']}",
+            f"   Precision: {m['precision']:.3f}",
+            f"   Recall:    {m['recall']:.3f}",
+            f"   F1:        {m['f1']:.3f}",
+            f"   MAE:       {m['mae']:.2f}",
+        ]
+    )
+    return "\n".join(lines) + "\n"
+
+
+def save_evaluation_report(
+    report: Dict[str, Any],
+    output_file: str | Path,
+) -> Path:
+    """Write JSON report and a companion .txt summary."""
+    output_path = Path(output_file)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with output_path.open("w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2)
+
+    txt_path = output_path.with_suffix(".txt")
+    txt_path.write_text(_format_summary_text(report), encoding="utf-8")
+    return output_path
 
 
 # ---------------------------------------------------------------------------
@@ -293,11 +477,73 @@ def main():
     from device_utils import add_device_argument, resolve_device
 
     add_device_argument(parser, default="auto")
+    parser.add_argument(
+        "--dataset_name",
+        type=str,
+        default=None,
+        help="Dataset label for output files (default: inferred from --image_dir)",
+    )
+    parser.add_argument(
+        "--output_file",
+        type=str,
+        default=None,
+        help="Path to save results JSON (default: evaluation_results_{dataset}.json)",
+    )
+    parser.add_argument(
+        "--no_save",
+        action="store_true",
+        help="Do not write results to disk",
+    )
+    parser.add_argument(
+        "--sweep_results",
+        type=str,
+        default=None,
+        help="binary_parameter_sweep_*.json — auto-set patch_size, stride, threshold",
+    )
+    parser.add_argument(
+        "--sweep_metric",
+        type=str,
+        default="mae",
+        choices=["mae", "f1"],
+        help="Use best_by_mae or best_by_f1 from sweep results (default: mae)",
+    )
+    parser.add_argument(
+        "--visualize_dir",
+        type=str,
+        default=None,
+        help="Save red-box overlays (overlays/) and coordinate files (coordinates/)",
+    )
+    parser.add_argument(
+        "--box_size",
+        type=int,
+        default=48,
+        help="Side length in pixels for red detection boxes (default: 48)",
+    )
     args = parser.parse_args()
     args.device = resolve_device(args.device)
+    dataset_name = args.dataset_name or _infer_dataset_name(args.image_dir)
+
+    if args.sweep_results:
+        sweep = load_sweep_detector_params(args.sweep_results, args.sweep_metric)
+        args.patch_size = int(sweep["patch_size"])
+        args.stride = int(sweep["stride"])
+        args.threshold = float(sweep["threshold"])
+        print(
+            f"Sweep ({args.sweep_metric}): patch_size={args.patch_size} "
+            f"stride={args.stride} threshold={args.threshold}"
+        )
+
+    visualize_dir = args.visualize_dir
+    if visualize_dir is None and not args.no_save:
+        visualize_dir = str(
+            WORKSPACE / f"detection_visualizations_{dataset_name.replace(' ', '_')}"
+        )
 
     print("🥜 Walnut Detection Evaluation")
+    print(f"Dataset: {dataset_name}")
     print(f"Device: {args.device}")
+    if visualize_dir:
+        print(f"Visualizations: {visualize_dir}")
     print("=" * 50)
 
     metrics = evaluate_dataset(
@@ -316,6 +562,8 @@ def main():
         match_radius=args.match_radius,
         device=args.device,
         verbose=True,
+        visualize_dir=visualize_dir,
+        box_size=args.box_size,
     )
 
     if metrics:
@@ -326,6 +574,38 @@ def main():
         print(f"   Recall:    {metrics['recall']:.3f}")
         print(f"   F1:        {metrics['f1']:.3f}")
         print(f"   MAE:       {metrics['mae']:.2f}")
+
+        if not args.no_save:
+            output_file = args.output_file or str(_default_output_path(dataset_name, args.split))
+            report = {
+                "dataset_name": dataset_name,
+                "split": args.split,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "model_path": args.model_path,
+                "image_dir": args.image_dir,
+                "annotation_dir": args.annotation_dir,
+                "split_file": args.split_file,
+                "device": args.device,
+                "detector": {
+                    "patch_size": args.patch_size,
+                    "stride": args.stride,
+                    "threshold": args.threshold,
+                    "cluster": args.cluster,
+                    "cluster_eps": args.cluster_eps,
+                    "local_max_size": args.local_max_size,
+                    "nms_radius": args.nms_radius,
+                    "match_radius": args.match_radius,
+                },
+                "metrics": metrics,
+                "visualize_dir": visualize_dir,
+                "box_size": args.box_size,
+            }
+            saved_path = save_evaluation_report(report, output_file)
+            print(f"\n💾 Saved {saved_path}")
+            print(f"💾 Saved {saved_path.with_suffix('.txt')}")
+            if visualize_dir:
+                print(f"💾 Red-box overlays: {visualize_dir}/overlays/")
+                print(f"💾 Coordinates:      {visualize_dir}/coordinates/")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Dataset / local artifacts (do not commit)
+InputData/
+models/
+
+# Evaluation outputs / visualizations
+detection_visualizations*/
+evaluation_results*.json
+evaluation_results*.txt
+detection terminal results.txt
+combine_datasets.py
+
